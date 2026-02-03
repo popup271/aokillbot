@@ -1,135 +1,234 @@
 const axios = require("axios");
 
+function norm(s) {
+  return String(s || "").trim().toLowerCase();
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 class KillFetcher {
   constructor(discordBot, config) {
     this.discordBot = discordBot;
     this.config = config;
-    this.publishedEventIds = new Set(); // Use a Set for efficient storage and lookup
-    this.fetchCount = 0; // Counter to track the number of fetches
-    this.isFetching = false;
-    this.lastFetchedEventId = null; // To store the ID of the first event of the last fetch
+
+    // Polling
+    this.pollMs = 60_000;           // 60s between polls
+    this.maxOffset = 1000;          // scan up to offset 1000
+    this.pageSize = 51;
+
+    // Networking
+    this.httpTimeout = 35_000;      // bumped from 20s -> 35s
+    this.maxRetries = 3;
+
+    // State
+    this.running = false;
+    this.inFlight = false;
+    this.lastSeenEventId = 0;       // highest EventId we’ve seen (stop point)
+    this.publishedEventIds = new Set();
+    this.maxPublishedKeep = 500;    // prevent unbounded memory growth
   }
 
-  async fetchKills(retryCount = 0) {
-    try {
-      const response = await axios.get(
-        `https://gameinfo.albiononline.com/api/gameinfo/events?limit=51&offset=0`
-      );
-      this.parseKills(response.data);
+  start() {
+    if (this.running) return;
+    this.running = true;
+    this._loop().catch((e) => console.error("KillFetcher fatal loop error:", e?.message || e));
+  }
 
-      // Log only every 10th fetch to reduce log spam
-      this.fetchCount++;
-      if (this.fetchCount % 10 === 0) {
-        console.log(`Fetched ${response.data.length} kills (fetch count: ${this.fetchCount})`);
+  stop() {
+    this.running = false;
+  }
+
+  // ----------------------------
+  // Filter logic (single truth)
+  // ----------------------------
+  matchesFilters(kill) {
+    const wantedGuild = norm(this.config.guildName);
+    const wantedAlliance = norm(this.config.allianceName);
+
+    const players = Array.isArray(this.discordBot.playerNames)
+      ? this.discordBot.playerNames
+      : [];
+
+    const killer = kill?.Killer || {};
+    const victim = kill?.Victim || {};
+
+    const killerGuild = norm(killer.GuildName);
+    const victimGuild = norm(victim.GuildName);
+
+    const killerAlliance = norm(killer.AllianceName);
+    const victimAlliance = norm(victim.AllianceName);
+
+    const killerName = norm(killer.Name);
+    const victimName = norm(victim.Name);
+
+    // If config has NOTHING set, match nothing (avoid “post everything”)
+    const hasAnyFilter =
+      Boolean(wantedGuild) ||
+      Boolean(wantedAlliance) ||
+      (players.length > 0);
+
+    if (!hasAnyFilter) {
+      return { ok: false, reason: "no filters configured" };
+    }
+
+    if (wantedGuild && (killerGuild === wantedGuild || victimGuild === wantedGuild)) {
+      return { ok: true, reason: "guild" };
+    }
+
+    if (wantedAlliance && (killerAlliance === wantedAlliance || victimAlliance === wantedAlliance)) {
+      return { ok: true, reason: "alliance" };
+    }
+
+    if (players.length > 0 && (players.includes(killerName) || players.includes(victimName))) {
+      return { ok: true, reason: "player" };
+    }
+
+    return { ok: false, reason: "no match" };
+  }
+
+  // ----------------------------
+  // Main loop (no overlaps)
+  // ----------------------------
+  async _loop() {
+    while (this.running) {
+      if (this.inFlight) {
+        // Shouldn’t happen, but safety guard
+        await sleep(1000);
+        continue;
       }
 
-      // Check if the first event ID is the same as the last fetched event ID
-      const firstEventId = response.data.length > 0 ? response.data[0].EventId : null;
-      if (firstEventId !== this.lastFetchedEventId) {
-        this.lastFetchedEventId = firstEventId;
-        this.fetchAllOffsets(); // Fetch all offsets if there are new events
+      this.inFlight = true;
+      try {
+        await this._pollOnce();
+      } catch (e) {
+        console.error("KillFetcher poll error:", e?.message || e);
+      } finally {
+        this.inFlight = false;
       }
 
-      // Recursive call with a delay
-      setTimeout(() => this.fetchKills(), 5000); // 5 second delay
-    } catch (error) {
-      console.error("Error fetching kills:", error.message);
-      if (retryCount < 5) { // Retry up to 5 times
-        console.log(`Retrying fetchKills (${retryCount + 1}/5)`);
-        setTimeout(() => this.fetchKills(retryCount + 1), 1000 * (retryCount + 1)); // Exponential backoff
-      } else {
-        console.error("Max retries reached for fetchKills");
-        // Continue fetching even if max retries reached
-        setTimeout(() => this.fetchKills(), 5000); // 5 second delay
-      }
+      await sleep(this.pollMs);
     }
   }
 
-  async fetchEventsTo(latestEventId, offset = 0, events = []) {
-    if (offset >= 1000) {
-      console.log(`Reached maximum offset of 1000. Total events fetched: ${events.length}`);
-      return events;
-    }
+  // ----------------------------
+  // One poll: scan offsets until we hit lastSeenEventId
+  // ----------------------------
+  async _pollOnce() {
+    let seen = 0;
+    let fresh = 0;
+    let matched = 0;
+    let queued = 0;
+    let skipped = 0;
 
-    try {
-      const response = await axios.get(
-        `https://gameinfo.albiononline.com/api/gameinfo/events?limit=51&offset=${offset}`
-      );
-      const albionEvents = response.data;
-      let foundLatest = false;
+    // Always start from offset 0 (newest)
+    for (let offset = 0; offset <= this.maxOffset; offset += this.pageSize) {
+      const page = await this._getEventsPage(offset);
 
-      for (const evt of albionEvents) {
-        if (!latestEventId) latestEventId = evt.EventId - 1;
-        if (evt.EventId <= latestEventId) {
-          foundLatest = true;
-          console.log(`Found event with ID ${evt.EventId} which is less than or equal to latestEventId ${latestEventId}. Breaking the loop at offset ${offset}.`);
+      if (!Array.isArray(page) || page.length === 0) break;
+
+      seen += page.length;
+
+      // Track the newest event id we saw on offset 0
+      if (offset === 0) {
+        const newest = page[0]?.EventId || 0;
+        if (newest > this.lastSeenEventId) {
+          // we *don’t* set lastSeenEventId yet; we do it after processing to avoid skipping
+        }
+      }
+
+      for (const kill of page) {
+        const id = kill?.EventId || 0;
+        if (!id) continue;
+
+        // Stop condition: once we reach events we’ve already “covered”
+        if (this.lastSeenEventId && id <= this.lastSeenEventId) {
+          // We can stop scanning deeper offsets entirely.
+          offset = this.maxOffset + this.pageSize; // break outer loop
           break;
         }
-        if (events.findIndex((e) => e.EventId === evt.EventId) < 0) {
-          events.push(evt);
+
+        fresh++;
+
+        // Don’t republish same event
+        if (this.publishedEventIds.has(id)) {
+          skipped++;
+          continue;
         }
-      }
 
-      return foundLatest
-        ? events
-        : this.fetchEventsTo(latestEventId, offset + albionEvents.length, events);
-    } catch (error) {
-      console.error(`Unable to fetch event data from API: ${error.message}. Retrying...`);
-      await new Promise(resolve => setTimeout(resolve, 5000));
-      return this.fetchEventsTo(latestEventId, offset, events);
-    }
-  }
+        const match = this.matchesFilters(kill);
+        if (!match.ok) {
+          skipped++;
+          continue;
+        }
 
-  async fetchAllOffsets() {
-    if (this.isFetching) return;
-    this.isFetching = true;
-
-    const events = await this.fetchEventsTo(this.lastFetchedEventId);
-    this.parseKills(events);
-
-    console.log(`Completed fetchAllOffsets. Total events fetched: ${events.length}`);
-    this.isFetching = false;
-
-    // Recursive call with a delay
-    setTimeout(() => this.fetchAllOffsets(), 20000); // 20 seconds delay
-  }
-
-  parseKills(events) {
-    // Sort events by kill timestamp before processing
-    events.sort((a, b) => new Date(a.TimeStamp) - new Date(b.TimeStamp));
-
-    events.forEach((kill) => {
-      if (this.publishedEventIds.has(kill.EventId)) return; // Check existence using Set's has method
-
-      if (
-        kill.Killer.AllianceName.toLowerCase() === this.config.allianceName.toLowerCase() ||
-        kill.Victim.AllianceName.toLowerCase() === this.config.allianceName.toLowerCase() ||
-        kill.Killer.GuildName.toLowerCase() === this.config.guildName.toLowerCase() ||
-        kill.Victim.GuildName.toLowerCase() === this.config.guildName.toLowerCase() ||
-        this.discordBot.playerNames.includes(kill.Killer.Name.toLowerCase()) ||
-        this.discordBot.playerNames.includes(kill.Victim.Name.toLowerCase())
-      ) {
-        console.log(`Posting kill due to alliance/guild/player match: ${kill.EventId}`);
+        matched++;
         this.discordBot.queueKill(kill);
-        this.publishedEventIds.add(kill.EventId); // Add to Set
+        queued++;
 
-        // Trim the set to maintain a maximum of 10 recent unique kills
-        if (this.publishedEventIds.size > 10) {
-          this.publishedEventIds.delete(this.publishedEventIds.values().next().value); // Remove oldest element
-        }
+        this._rememberPublished(id);
       }
-    });
+    }
 
-    console.log(`Parsed ${events.length} kills, ${this.publishedEventIds.size} unique kills published recently`);
+    // After successful scan, update lastSeenEventId to the newest EventId we saw at offset 0
+    // (Do another quick fetch of offset 0, so our stop point is always correct even if earlier pages timed out)
+    const head = await this._getEventsPage(0).catch(() => null);
+    const newestNow = Array.isArray(head) && head[0]?.EventId ? head[0].EventId : 0;
+    if (newestNow > this.lastSeenEventId) this.lastSeenEventId = newestNow;
+
+    console.log(
+      `KillFetcher: seen=${seen} fresh=${fresh} matched=${matched} queued=${queued} skipped=${skipped} lastSeen=${this.lastSeenEventId}`
+    );
   }
 
-  async fetchEventById(eventId) {
-    try {
-      const response = await axios.get(`https://gameinfo.albiononline.com/api/gameinfo/events/${eventId}`);
-      return response.data;
-    } catch (error) {
-      console.error("Error fetching event info:", error);
+  _rememberPublished(id) {
+    this.publishedEventIds.add(id);
+
+    // Trim the set to avoid growing forever
+    if (this.publishedEventIds.size > this.maxPublishedKeep) {
+      // delete oldest inserted items
+      const over = this.publishedEventIds.size - this.maxPublishedKeep;
+      const it = this.publishedEventIds.values();
+      for (let i = 0; i < over; i++) {
+        const v = it.next().value;
+        this.publishedEventIds.delete(v);
+      }
     }
+  }
+
+  // ----------------------------
+  // HTTP with retries/backoff
+  // ----------------------------
+  async _getEventsPage(offset) {
+    const url = `https://gameinfo.albiononline.com/api/gameinfo/events?limit=${this.pageSize}&offset=${offset}`;
+
+    let lastErr = null;
+    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      try {
+        const res = await axios.get(url, { timeout: this.httpTimeout });
+        return res.data;
+      } catch (e) {
+        lastErr = e;
+        const msg = e?.message || String(e);
+        const isTimeout = msg.includes("timeout");
+
+        // backoff: 0.5s, 1s, 2s
+        const backoff = 500 * Math.pow(2, attempt);
+        if (attempt < this.maxRetries) {
+          if (isTimeout) {
+            // Only log timeouts at low noise
+            console.warn(`KillFetcher: timeout at offset=${offset}, retrying in ${backoff}ms...`);
+          } else {
+            console.warn(`KillFetcher: HTTP error at offset=${offset}: ${msg} (retry in ${backoff}ms)`);
+          }
+          await sleep(backoff);
+          continue;
+        }
+      }
+    }
+
+    throw lastErr;
   }
 }
 

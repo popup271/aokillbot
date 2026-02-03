@@ -1,7 +1,7 @@
-# Use the latest Node.js image as the base
-FROM node:latest
+# ---- Pin Node.js to 20 LTS (canvas-compatible) ----
+FROM node:20-bookworm
 
-# Install dependencies for canvas
+# ---- Install system dependencies required by canvas ----
 RUN apt-get update && apt-get install -y \
     libcairo2-dev \
     libpango1.0-dev \
@@ -11,20 +11,17 @@ RUN apt-get update && apt-get install -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Set the working directory
+# ---- Set the working directory ----
 WORKDIR /usr/src/app
 
-# Copy package.json and package-lock.json
+# ---- Copy package files first for better caching ----
 COPY package*.json ./
 
-# Install dependencies with npm using cache directory
-RUN npm install --prefer-offline --no-audit --cache /tmp/.npm --prefer-offline
+# ---- Install npm dependencies ----
+RUN npm install --prefer-offline --no-audit --cache /tmp/.npm
 
-# Copy the rest of the application code
+# ---- Copy the rest of the application code ----
 COPY . .
 
-# Rebuild native modules
-RUN npm rebuild canvas
-
-# Command to run the app
+# ---- Start the application ----
 CMD ["npm", "start"]
