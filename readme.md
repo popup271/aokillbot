@@ -14,9 +14,9 @@ These instructions will get you a copy of the project up and running on your loc
 
 ### Usage
 
-* `!ping` - replies with @user pong
-* `!kbclear` - deletes all messages in the config.botChannel
-* `!kbinfo <eventId>` - displays the kill board post for a specific kill to the current channel
+* `/profile` - shows kill/death stats of a player from posted kills
+* `/summary` - shows summary of posted kills
+
 
 ### Prerequisites
 
@@ -82,66 +82,6 @@ These instructions will get you a copy of the project up and running on your loc
     docker build -t aokillboard-discordbot .
     docker run -d --name aokillboard-discordbot aokillboard-discordbot
     docker logs -f aokillboard-discordbot
-
-### 3. Running on AWS EC2
-
-1. **Launch an EC2 instance:**
-
-    * Use the AWS Management Console to launch an EC2 instance with Amazon Linux 2 AMI
-    * Ensure the instance has a security group that allows inbound SSH (port 22) and the port your bot will use (usually 443 for HTTPS)
-
-2. **Connect to your EC2 instance:**
-    ```sh
-    ssh -i /path/to/your-key-pair.pem ec2-user@your-ec2-public-ip
-
-3. **Install Docker on EC2:**
-    ```sh
-    sudo yum update -y
-    sudo amazon-linux-extras install docker
-    sudo service docker start
-    sudo usermod -a -G docker ec2-user
-
-4. **Logout and login again to apply the Docker group changes:**
-    ```sh
-     exit
-    ssh -i /path/to/your-key-pair.pem ec2-user@your-ec2-public-ip
-
-5. **Install Node.js dependencies for buildiung the Docker image:**
-    ```sh
-    sudo yum install -y gcc-c++ make
-    curl -sL https://rpm.nodesource.com/setup_16.x | sudo bash -
-    sudo yum install -y nodejs
-
-6. **Clone the repository on EC2:**
-    ```sh
-    git clone https://github.com/pierrefeza/AOKillBoard-DiscordBot.git
-    cd AOKillBoard-DiscordBot
-
-7. **Copy your local `config.json` to the EC2 instance:**
-    ```sh
-    scp -i /path/to/your-key-pair.pem /path/to/your/config.json ec2-user@your-ec2-public-ip:/home/ec2-user/AOKillBoard-DiscordBot/
-
-8. **Build the Docker image on EC2:**
-    ```sh
-    docker build -t aokillboard-discordbot .
-
-9. **Run the Docker container on EC2:**
-    ```sh
-    docker run -d --name aokillboard-discordbot aokillboard-discordbot
-
-10. **Check the logs to ensure the bot is running:**
-    ```sh
-    docker logs -f aokillboard-discordbot
-
-
- 11. **Commands to clean docker env***
-      ```sh
-      docker image prune -a -f
-      docker container prune -f
-      docker volume prune -f
-      docker network prune -f
-      docker system prune -a -f
-
 
 ### Built With
 
